@@ -18,6 +18,10 @@
 #include <mgba/core/scripting.h>
 #endif
 
+#include <mgba/internal/arm/arm.h>
+#include <mgba/internal/arm/decoder.h>
+#include <mgba/internal/arm/debugger/debugger.h>
+
 const uint32_t DEBUGGER_ID = 0xDEADBEEF;
 
 mLOG_DEFINE_CATEGORY(DEBUGGER, "Debugger", "core.debugger");
@@ -79,13 +83,68 @@ void mDebuggerAttach(struct mDebugger* debugger, struct mCore* core) {
 	core->attachDebugger(core, debugger);
 }
 
+FILE *callTraceFp;
+
 void mDebuggerRun(struct mDebugger* debugger) {
+	struct ARMDebugger* _debugger = (struct ARMDebugger*) debugger->platform;
+	struct ARMCore* cpu = _debugger->cpu;
+	struct ARMInstructionInfo info;
+	static bool branch = false;
+	static uint8_t combinedState = 0;
+	bool skip = false;
+	int pcPrev;
+
 	switch (debugger->state) {
 	case DEBUGGER_RUNNING:
 		if (!debugger->platform->hasBreakpoints(debugger->platform)) {
 			debugger->core->runLoop(debugger->core);
 		} else {
+			if (cpu->executionMode == MODE_ARM) {
+				uint32_t instruction = cpu->prefetch[0];
+				ARMDecodeARM(instruction, &info);
+			} else if (combinedState == 0) {
+				struct ARMInstructionInfo info2;
+				struct ARMInstructionInfo combined;
+				uint16_t instruction = cpu->prefetch[0];
+				uint16_t instruction2 = cpu->prefetch[1];
+				ARMDecodeThumb(instruction, &info);
+				ARMDecodeThumb(instruction2, &info2);
+				if (ARMDecodeThumbCombine(&info, &info2, &combined)) {
+					info = combined;
+					combinedState = 1;
+				}
+			} else if (combinedState == 1) {
+				combinedState = 2;
+			}
+			pcPrev = cpu->gprs[ARM_PC] - (cpu->executionMode == MODE_ARM ? WORD_SIZE_ARM : WORD_SIZE_THUMB);
+			if (info.branchType == ARM_BRANCH_LINKED && combinedState < 2) {
+				fprintf(callTraceFp, "%s ", cpu->executionMode == MODE_ARM ? "A" : "T");
+				fprintf(callTraceFp, "0x%08x bl ", cpu->gprs[ARM_PC] - (cpu->executionMode == MODE_ARM ? WORD_SIZE_ARM : WORD_SIZE_THUMB));
+				branch = true;
+			} else if (info.branchType == ARM_BRANCH_INDIRECT) {
+				fprintf(callTraceFp, "%s ", cpu->executionMode == MODE_ARM ? "A" : "T");
+				fprintf(callTraceFp, "0x%08x bx ", cpu->gprs[ARM_PC] - (cpu->executionMode == MODE_ARM ? WORD_SIZE_ARM : WORD_SIZE_THUMB));
+				branch = true;
+			} else if (info.branchType == ARM_BRANCH) {
+				skip = true;
+			}
 			debugger->core->step(debugger->core);
+			if (!branch && !skip && combinedState == 0) {
+				if ((cpu->gprs[ARM_PC] - (cpu->executionMode == MODE_ARM ? WORD_SIZE_ARM : WORD_SIZE_THUMB)) !=
+				    (pcPrev + ((cpu->executionMode == MODE_ARM ? WORD_SIZE_ARM : WORD_SIZE_THUMB)))) {
+					fprintf(callTraceFp, "? 0x%08x ?? ", pcPrev);
+					fprintf(callTraceFp, "%s ", cpu->executionMode == MODE_ARM ? "A" : "T");
+					fprintf(callTraceFp, "0x%08x\n", cpu->gprs[ARM_PC] - (cpu->executionMode == MODE_ARM ? WORD_SIZE_ARM : WORD_SIZE_THUMB));
+				}
+			}
+			if (branch && combinedState != 1) {
+				fprintf(callTraceFp, "%s ", cpu->executionMode == MODE_ARM ? "A" : "T");
+				fprintf(callTraceFp, "0x%08x\n", cpu->gprs[ARM_PC] - (cpu->executionMode == MODE_ARM ? WORD_SIZE_ARM : WORD_SIZE_THUMB));
+				branch = false;
+				if (combinedState == 2) {
+					combinedState = 0;
+				}
+			}
 			debugger->platform->checkBreakpoints(debugger->platform);
 		}
 		break;
@@ -132,6 +191,8 @@ static void mDebuggerInit(void* cpu, struct mCPUComponent* component) {
 	if (debugger->init) {
 		debugger->init(debugger);
 	}
+	printf("Hello\n");
+	callTraceFp = fopen("/tmp/call_trace.log", "w+");
 }
 
 static void mDebuggerDeinit(struct mCPUComponent* component) {
@@ -140,6 +201,8 @@ static void mDebuggerDeinit(struct mCPUComponent* component) {
 		debugger->deinit(debugger);
 	}
 	debugger->platform->deinit(debugger->platform);
+	printf("Goodbye\n");
+	fclose(callTraceFp);
 }
 
 bool mDebuggerLookupIdentifier(struct mDebugger* debugger, const char* name, int32_t* value, int* segment) {
